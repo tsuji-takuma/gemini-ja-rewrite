@@ -1,0 +1,11 @@
+# API キーを誤ってコミットしないため
+.env
+.env.*
+api_key
+*.key
+
+__pycache__/
+*.pyc
+
+# skill-creator の評価用ワークスペース
+gemini-ja-rewrite-workspace/
