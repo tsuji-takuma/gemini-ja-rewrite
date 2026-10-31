@@ -18,6 +18,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -82,18 +83,20 @@ def apply_mask(text: str, mapping: Dict[str, str]) -> str:
 
 
 def unmask(text: str, mapping: Dict[str, str]) -> Tuple[str, List[str], List[str]]:
-    """目印を元に戻し、消えた目印と増えた目印を返す。"""
-    found = PLACEHOLDER_RE.findall(text)
-    found_tokens = [PLACEHOLDER_FMT.format(n) for n in found]
-    missing = [t for t in mapping if t not in found_tokens]
-    duplicated = sorted({t for t in found_tokens if found_tokens.count(t) > 1})
-    unknown = sorted({t for t in found_tokens if t not in mapping})
+    """目印を元に戻し、消えた目印と知らない目印を返す。
+
+    同じコードが原文に何度も出ることがあり、文を整えると回数も変わりうるので、
+    回数の違いは問わない。1回も出てこない目印だけを消えたものとして扱う。
+    """
+    found = {PLACEHOLDER_FMT.format(n) for n in PLACEHOLDER_RE.findall(text)}
+    missing = [t for t in mapping if t not in found]
+    unknown = sorted(t for t in found if t not in mapping)
 
     def restore(match: "re.Match[str]") -> str:
         return mapping.get(match.group(0), match.group(0))
 
     restored = PLACEHOLDER_RE.sub(restore, text)
-    return restored, missing, duplicated + unknown
+    return restored, missing, unknown
 
 
 # --- API キーの探索 -----------------------------------------------------
@@ -303,6 +306,89 @@ def extract_text(response: dict) -> Tuple[str, Optional[str]]:
     return text, finish
 
 
+# --- 使用量と料金 -------------------------------------------------------
+#
+# 100万トークンあたりの米ドル。(適用開始日, 入力, 出力（思考を含む）, キャッシュ済みの入力)
+# 出典: https://ai.google.dev/gemini-api/docs/pricing（2026-11-01 時点）。単価が変わったらここを直す。
+# gemini-3.1-pro-preview の 20万トークンを超えるプロンプトの単価は、この用途では使わないので省く。
+
+PRICES: Dict[str, List[Tuple[str, float, float, float]]] = {
+    "gemini-3.8-flash": [("", 0.75, 3.75, 0.075), ("2027-01-01", 1.50, 7.50, 0.15)],
+    "gemini-3.6-flash": [("", 0.75, 3.75, 0.075), ("2027-01-01", 1.50, 7.50, 0.15)],
+    "gemini-3.5-flash-lite": [("", 0.30, 2.50, 0.03)],
+    "gemini-4-argon": [("", 2.00, 10.00, 0.10), ("2026-12-01", 4.00, 20.00, 0.20)],
+    "gemini-3.1-pro-preview": [("", 2.00, 12.00, 0.20)],
+}
+DEFAULT_JPY_PER_USD = 150.0
+USAGE_LOG_NAME = "usage.jsonl"
+
+
+def usage_from(response: dict) -> Dict[str, int]:
+    meta = response.get("usageMetadata") or {}
+    return {
+        "input": int(meta.get("promptTokenCount") or 0),
+        "cached": int(meta.get("cachedContentTokenCount") or 0),
+        "output": int(meta.get("candidatesTokenCount") or 0),
+        "thinking": int(meta.get("thoughtsTokenCount") or 0),
+    }
+
+
+def estimate_cost(model: str, usage: Dict[str, int], today: date) -> Optional[float]:
+    """料金を米ドルで返す。単価表にないモデルは None。"""
+    tiers = PRICES.get(model)
+    if not tiers:
+        return None
+    _, p_in, p_out, p_cached = [t for t in tiers if t[0] <= today.isoformat()][-1]
+    uncached = usage["input"] - usage["cached"]
+    billed_output = usage["output"] + usage["thinking"]
+    return (uncached * p_in + usage["cached"] * p_cached + billed_output * p_out) / 1_000_000
+
+
+def jpy_per_usd() -> float:
+    try:
+        return float(os.environ.get("GEMINI_JPY_PER_USD", DEFAULT_JPY_PER_USD))
+    except ValueError:
+        return DEFAULT_JPY_PER_USD
+
+
+def format_cost(usd: float) -> str:
+    return f"${usd:.4f}（約{usd * jpy_per_usd():.1f}円）"
+
+
+def record_usage(log_path: Path, entry: dict) -> Tuple[float, int]:
+    """作業ディレクトリの記録に1回分を足し、料金の累計と回数を返す。"""
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    total, calls = 0.0, 0
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            usd = json.loads(line).get("usd")
+        except ValueError:
+            continue
+        calls += 1
+        total += usd or 0.0
+    return total, calls
+
+
+def report_usage(model: str, response: dict, out: Optional[str], warn) -> None:
+    usage = usage_from(response)
+    usd = estimate_cost(model, usage, date.today())
+    cached = f"（うちキャッシュ {usage['cached']:,}）" if usage["cached"] else ""
+    warn(
+        f"使用量: 入力 {usage['input']:,}{cached} / 出力 {usage['output']:,}"
+        f" / 思考 {usage['thinking']:,} トークン"
+    )
+    if usd is None:
+        warn(f"料金: {model} は単価表にないため計算できません。")
+        return
+    line = f"料金: {format_cost(usd)}"
+    if out:
+        entry = {"out": Path(out).name, "model": model, **usage, "usd": round(usd, 6)}
+        total, calls = record_usage(Path(out).resolve().parent / USAGE_LOG_NAME, entry)
+        line += f" / この作業ディレクトリの累計: {format_cost(total)}、{calls}回"
+    warn(line)
+
+
 def strip_wrapping_fence(text: str) -> str:
     """全体がコードフェンスで囲まれて返ってきたときだけ外す。"""
     match = re.fullmatch(r"\s*```[a-zA-Z]*\n(.*)\n```\s*", text, re.DOTALL)
@@ -363,6 +449,14 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
     url = f"{API_BASE}/models/{model}:generateContent"
     try:
         response = http_json("POST", url, api_key, build_request_body(system_prompt, user_prompt))
+    except RewriteError as err:
+        warn(str(err))
+        return EXIT_API
+
+    # 書き直しが使えなくても料金はかかるので、先に記録する
+    print(f"model: {model} / API キー: {source}", file=sys.stderr)
+    report_usage(model, response, args.out, warn)
+    try:
         text, finish = extract_text(response)
     except RewriteError as err:
         warn(str(err))
@@ -376,7 +470,6 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
     else:
         sys.stdout.write(restored)
 
-    print(f"model: {model} / API キー: {source} / finishReason: {finish}", file=sys.stderr)
     if finish and finish != "STOP":
         warn(f"警告: 応答が途中で終わった可能性があります（finishReason: {finish}）。")
     if missing or extra:
@@ -384,7 +477,7 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
         if missing:
             problems.append("消えた部分: " + " / ".join(mapping[t] for t in missing))
         if extra:
-            problems.append("重複または不明な目印: " + ", ".join(extra))
+            problems.append("原文にない目印: " + ", ".join(extra))
         warn("保護したコードや URL が書き直し後に揃っていません。" + "; ".join(problems))
         return EXIT_PLACEHOLDER
     return EXIT_OK

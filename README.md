@@ -70,6 +70,8 @@ python3 ~/.claude/skills/gemini-ja-rewrite/scripts/gemini_rewrite.py --list-mode
 
 2,000字程度の文章を1回書き直す料金は、`gemini-3.8-flash` で約2.5円です（2026年11月時点の公式料金、1ドル150円で換算）。最上位の `gemini-4-argon` では約7円です。
 
+書き直しのたびに、Gemini の応答に含まれる実際の使用量（入力、出力、思考のトークン数）から料金を計算して表示します。単価は `scripts/gemini_rewrite.py` の `PRICES` に書いてあるので、公式の料金が変わったらそこを直してください。円への換算は1ドル150円で、環境変数 `GEMINI_JPY_PER_USD` で変えられます。
+
 無料枠で送った文章は Google の製品改善に使われます。仕事の文章を送るなら、課金を有効にした有料枠のキーを使ってください。
 
 ## テスト

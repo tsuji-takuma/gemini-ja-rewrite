@@ -50,6 +50,12 @@ class MaskTest(unittest.TestCase):
         self.assertEqual(missing, ["{{KEEP2}}"])
         self.assertEqual(extra, ["{{KEEP9}}"])
 
+    def test_repeated_segment_is_not_an_error(self):
+        _, mapping = gr.mask("`a` と `a` と `a`")
+        restored, missing, extra = gr.unmask("{{KEEP1}} を2回 {{KEEP1}}", mapping)
+        self.assertEqual(restored, "`a` を2回 `a`")
+        self.assertEqual((missing, extra), ([], []))
+
     def test_apply_mask_to_previous(self):
         _, mapping = gr.mask("`foo` を使う")
         self.assertEqual(gr.apply_mask("まず `foo` を使います", mapping), "まず {{KEEP1}} を使います")
@@ -182,6 +188,46 @@ class PromptAndResponseTest(unittest.TestCase):
         self.assertEqual(gr.strip_wrapping_fence("本文\n```a\n```\n"), "本文\n```a\n```\n")
 
 
+class UsageTest(unittest.TestCase):
+    USAGE = {"input": 1_000_000, "cached": 0, "output": 600_000, "thinking": 400_000}
+
+    def test_usage_from_response(self):
+        response = {
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "cachedContentTokenCount": 4,
+                "candidatesTokenCount": 7,
+                "thoughtsTokenCount": 3,
+            }
+        }
+        self.assertEqual(gr.usage_from(response), {"input": 10, "cached": 4, "output": 7, "thinking": 3})
+        self.assertEqual(gr.usage_from({}), {"input": 0, "cached": 0, "output": 0, "thinking": 0})
+
+    def test_thinking_is_billed_as_output(self):
+        usd = gr.estimate_cost("gemini-3.8-flash", self.USAGE, gr.date(2026, 11, 1))
+        self.assertAlmostEqual(usd, 0.75 + 3.75)
+
+    def test_price_changes_by_date(self):
+        usd = gr.estimate_cost("gemini-3.8-flash", self.USAGE, gr.date(2027, 1, 1))
+        self.assertAlmostEqual(usd, 1.50 + 7.50)
+
+    def test_cached_input_uses_cache_price(self):
+        usage = {"input": 1_000_000, "cached": 1_000_000, "output": 0, "thinking": 0}
+        usd = gr.estimate_cost("gemini-3.8-flash", usage, gr.date(2026, 11, 1))
+        self.assertAlmostEqual(usd, 0.075)
+
+    def test_unknown_model(self):
+        self.assertIsNone(gr.estimate_cost("gemini-9", self.USAGE, gr.date(2026, 11, 1)))
+
+    def test_record_usage_accumulates(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / gr.USAGE_LOG_NAME
+            gr.record_usage(log, {"usd": 0.01})
+            total, calls = gr.record_usage(log, {"usd": 0.02})
+        self.assertAlmostEqual(total, 0.03)
+        self.assertEqual(calls, 2)
+
+
 class CommandTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -203,7 +249,27 @@ class CommandTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def fake_response(self, text):
-        return {"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}]}
+        return {
+            "candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 500, "thoughtsTokenCount": 300},
+        }
+
+    def test_reports_cost_and_running_total(self):
+        response = self.fake_response("{{KEEP1}} を実行します。")
+        with mock.patch.object(gr, "http_json", return_value=response):
+            self.run_main("--original", str(self.original), "--out", str(self.out))
+            _, _, err = self.run_main("--original", str(self.original), "--out", str(self.dir / "attempt2.md"))
+        self.assertIn("思考 300 トークン", err)
+        self.assertIn("料金: $", err)
+        self.assertIn("2回", err)
+        self.assertEqual(len((self.dir / gr.USAGE_LOG_NAME).read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_cost_is_recorded_even_when_placeholder_missing(self):
+        with mock.patch.object(gr, "http_json", return_value=self.fake_response("実行します。")):
+            code, _, err = self.run_main("--original", str(self.original), "--out", str(self.out))
+        self.assertEqual(code, gr.EXIT_PLACEHOLDER)
+        self.assertIn("料金: $", err)
+        self.assertTrue((self.dir / gr.USAGE_LOG_NAME).exists())
 
     def test_dry_run_does_not_call_api(self):
         with mock.patch.object(gr, "http_json") as http:
