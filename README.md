@@ -1,47 +1,103 @@
 # gemini-ja-rewrite
 
-Claude Code 用のスキルです。Gemini API を使って日本語の文章を自然な表現へと書き直し、原文から意味が変わっていないかを Claude が突き合わせて検証します。意味にずれがあれば Gemini に差し戻し、基準を満たすまで（最大3回）推敲を繰り返します。
+AI が書いた日本語を Gemini API で自然な文章に書き直し、意味が変わっていないかを Claude が検証する Claude Code 用のスキルです。
 
-詳しい処理の流れは、Claude 用の手順書である [SKILL.md](SKILL.md) をご覧ください。
+## 仕組み
 
-## 使い方
+AI が生成した日本語には、直訳調の言い回しや硬い名詞の連続など、読み手が違和感を覚える不自然さが残りがちです。一方で、別のモデルに書き直させると、文章は自然になっても意味が少しずつ変わってしまうことがあります。
 
-Claude Code から、対象の文章を指定して呼び出します。
+本スキルでは役割を明確に分担し、自然さと正確さの両立を図っています。
+
+- **Gemini**：日本語として自然で読みやすい言い回しに書き直します。
+- **Claude**：書き直した文章を原文と突き合わせ、主張、条件、数値、否定、確信度などが損なわれていないかを検証します。
+
+意味の変化が見つかった場合、Claude はその箇所だけを具体的に指摘して Gemini に差し戻します。検証を通過するまで最大3回やり取りを重ね、最終的に合格した版を出力します。
 
 ```
-/gemini-ja-rewrite さっきの返答をリライトして
+原文 ─→ Gemini が書き直す ─→ Claude が原文と見比べる ─→ 合格なら提示
+              ↑                          │
+              └──── 変わった箇所を指摘 ←───┘（最大3回）
 ```
 
-`disable-model-invocation: true` に設定されているため、Claude が独断でこのスキルを実行することはありません。明示的に呼び出したときにのみ Gemini へ送信され、料金が発生します。
+詳しい処理の流れは、Claude 向けの手順書 [SKILL.md](SKILL.md) を参照してください。
 
-## セットアップ
+## 必要な環境
 
-### 1. スキルの登録
+- Claude Code
+- Python 3.9 以上（標準ライブラリのみで動作するため、追加パッケージのインストールは不要です）
+- Gemini API キー（取得方法は [Gemini API のドキュメント](https://ai.google.dev/gemini-api/docs/api-key) を参照してください）
+
+## インストール
+
+### 1. スキルの配置
+
+Claude Code のスキル用ディレクトリにリポジトリをクローンします。
 
 ```bash
-ln -s ~/hobby/gemini-ja-rewrite ~/.claude/skills/gemini-ja-rewrite
+git clone https://github.com/tsuji-takuma/gemini-ja-rewrite.git ~/.claude/skills/gemini-ja-rewrite
 ```
+
+別の場所で管理したい場合は、クローン先ディレクトリへのシンボリックリンクを `~/.claude/skills/gemini-ja-rewrite` に作成してください。`/gemini-ja-rewrite` が認識されないときは、Claude Code を再起動してください。
 
 ### 2. API キーの設定
 
-スクリプトは次の優先順位でキーを探索し、最初に見つかったものを使用します。
-
-1. 環境変数 `GEMINI_API_KEY`
-2. 作業リポジトリ内の `.env` にある `GEMINI_API_KEY` の記述（カレントディレクトリから Git ルートまで探索）
-3. 環境変数 `GEMINI_API_KEY_CMD` で指定されたコマンドの出力結果
-4. `~/.config/gemini-ja-rewrite/api_key`
-
-普段は 4 の共通ファイルにキーを1つ置いておき、プロジェクトごとにキーを分けたいリポジトリでのみ `.env` を使う運用を想定しています。`.env` を使う場合は、[.env.example](.env.example) をコピーしてキーを記入してください。
-
-共通ファイルにキーを保存するには、次のコマンドを実行します。キーがシェルの実行履歴に残らないよう、対話式で入力を受け付ける構成にしています。
+もっとも手軽なのは、`~/.config/gemini-ja-rewrite/api_key` に保存する方法です。以下のコマンドを実行するとプロンプト経由で入力できるため、キーがシェルの履歴に残りません（zsh 用）。
 
 ```bash
 mkdir -p ~/.config/gemini-ja-rewrite && (umask 077; read -rs "k?Gemini API key: " && printf '%s\n' "$k" > ~/.config/gemini-ja-rewrite/api_key)
 ```
 
-上記は zsh 用です。bash をお使いの場合は、`read -rsp "Gemini API key: " k` に置き換えて実行してください。
+bash をお使いの場合は、`read -rs "k?Gemini API key: "` を `read -rsp "Gemini API key: " k` に置き換えてください。その他の設定方法については「設定」セクションを参照してください。
 
-macOS のキーチェーンや Linux の Secret Service にキーを保存したい場合は、値を取り出すコマンドを `GEMINI_API_KEY_CMD` に指定します。このコマンドはシェルを介さず直接実行されるため、パイプは使用できません。
+### 3. 動作確認
+
+API は呼び出さず、送信予定の内容とキーの取得元のみを確認します。料金は発生しません。
+
+```bash
+printf 'テストの文章です。\n' > /tmp/gjr-test.md && python3 ~/.claude/skills/gemini-ja-rewrite/scripts/gemini_rewrite.py --original /tmp/gjr-test.md --dry-run
+```
+
+## 使い方
+
+Claude Code 上で、書き直したい文章を指定してスキルを呼び出します。
+
+```
+/gemini-ja-rewrite さっきの返答をリライトして
+```
+
+```
+/gemini-ja-rewrite README.md をリポジトリの README として適切な文体で書き直して
+```
+
+対象とする文章には、Claude が会話内で生成したテキストのほか、直接貼り付けた文章やファイル内のテキストも指定できます。「リポジトリの README として適切な文体で」といった補足指示を添えると、そのまま Gemini に渡されます。
+
+検証に合格すると、出力された文章の末尾に次のような情報が添えられます。
+
+```
+Gemini（gemini-3.8-flash）の書き直しを2回目で採用しました。料金は2回分で約2.1円（0.0140 ドル）でした。
+```
+
+なお、このスキルは明示的に呼び出したときのみ動作します（`disable-model-invocation: true`）。Claude が自身の判断で勝手に Gemini を呼び出し、意図しない料金が発生することはありません。
+
+## 設定
+
+| 環境変数 | 内容 | 既定値 |
+|---|---|---|
+| `GEMINI_API_KEY` | API キー | なし |
+| `GEMINI_API_KEY_CMD` | API キーを取り出すコマンド（シェルを経由せず直接実行するため、パイプは使用できません） | なし |
+| `GEMINI_MODEL` | 使用するモデル | `gemini-3.8-flash` |
+| `GEMINI_JPY_PER_USD` | 料金を日本円に換算する際の為替レート | `150` |
+
+API キーは次の優先順位で探索され、最初に見つかったものが使用されます。
+
+1. 環境変数 `GEMINI_API_KEY`
+2. 作業中リポジトリの `.env` に設定された `GEMINI_API_KEY`（作業ディレクトリから Git のルートまで探索）
+3. `GEMINI_API_KEY_CMD` の出力結果
+4. `~/.config/gemini-ja-rewrite/api_key`
+
+通常は 4 に1つ設定しておき、プロジェクトごとにキーを使い分けたいリポジトリでのみ `.env` を利用する形を想定しています。`.env` の書き方については [.env.example](.env.example) を参照してください。なお、`.env` から読み込まれるのは `GEMINI_API_KEY` のみです。
+
+macOS のキーチェーンや Linux の Secret Service に保存したキーを利用する例です。
 
 ```bash
 # macOS
@@ -50,32 +106,26 @@ export GEMINI_API_KEY_CMD="security find-generic-password -s gemini-api-key -w"
 export GEMINI_API_KEY_CMD="secret-tool lookup service gemini-api-key"
 ```
 
-### 3. 動作確認
+## 料金とデータの取り扱い
 
-API を呼び出さずに、送信内容と API キーの参照元のみを出力します。
+- 書き直しの対象となる文章は Google のサーバーに送信されます。無料枠のキーで送信された文章は、Google の製品改善に利用されます。業務上の文章を扱う場合は、課金設定を有効にした有料枠のキーを使用してください。
+- 実行ごとに、実際のトークン消費量に基づいて計算された料金が表示されます。
+- 目安として、`gemini-3.8-flash` を使用して約1万字の文章を1回書き直した場合の料金は、5〜7円程度でした（2026年11月計測）。差し戻しが発生した場合は原文と前回の出力内容の双方が送信されるため、2回目以降の処理費用は1回目よりも高くなります。
+- 最新の料金単価については、[Gemini API の料金ページ](https://ai.google.dev/gemini-api/docs/pricing) を確認してください。
 
-```bash
-printf 'テストの文章です。\n' > /tmp/gjr-test.md && python3 ~/.claude/skills/gemini-ja-rewrite/scripts/gemini_rewrite.py --original /tmp/gjr-test.md --dry-run
-```
+## 開発
 
-利用可能なモデルの一覧を表示します。
-
-```bash
-python3 ~/.claude/skills/gemini-ja-rewrite/scripts/gemini_rewrite.py --list-models
-```
-
-## モデルと料金
-
-デフォルトのモデルは `gemini-3.8-flash` です。文章の自然さを整える用途であれば Flash で十分に対応できます。モデルを変更したい場合は、環境変数 `GEMINI_MODEL` を指定してください。
-
-2,000字程度の文章を1回書き直す場合の料金は、`gemini-3.8-flash` で約2.5円です（2026年11月時点の公式料金、1ドル＝150円換算）。最上位モデルの `gemini-4-argon` を使用した場合は約7円となります。
-
-推敲を行うたびに、Gemini のレスポンスに含まれる実際の使用量（入力・出力・思考の各トークン数）に基づいて料金を算出して表示します。計算用の単価は `scripts/gemini_rewrite.py` 内の `PRICES` に定義されているため、公式料金の改定があった際はこちらを更新してください。日本円への換算レートは 1ドル＝150円 を基準としており、環境変数 `GEMINI_JPY_PER_USD` で変更可能です。
-
-無料枠のキーで送信された文章は、Google の製品改善データとして利用されます。業務関連の文章を扱う際は、課金を有効化した有料枠のキーを使用してください。
-
-## テスト
+テストを実行します。API の呼び出しは行いません。
 
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+ファイル構成は次のとおりです。
+
+- `SKILL.md`：Claude 向けの手順書
+- `prompts/gemini.md`：Gemini へのシステム指示
+- `scripts/gemini_rewrite.py`：Gemini に1回分の書き直しをリクエストするスクリプト
+- `tests/`：単体テストコード
+
+料金計算に使用する単価は `scripts/gemini_rewrite.py` 内の `PRICES` で定義されています。公式の価格改定があった場合は、こちらの値を更新してください。
