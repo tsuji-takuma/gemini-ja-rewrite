@@ -129,3 +129,7 @@ python3 -m unittest discover -s tests
 - `tests/`：単体テストコード
 
 料金計算に使用する単価は `scripts/gemini_rewrite.py` 内の `PRICES` で定義されています。公式の価格改定があった場合は、こちらの値を更新してください。
+
+## ライセンス
+
+[MIT](LICENSE) © tsuji-takuma
