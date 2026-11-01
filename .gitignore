@@ -1,6 +1,7 @@
 # API キーを誤ってコミットしないため
 .env
 .env.*
+!.env.example
 api_key
 *.key
 
